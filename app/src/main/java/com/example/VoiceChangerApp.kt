@@ -5,6 +5,7 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.content.Context
 import android.os.Build
+import com.example.audio.AudioDeviceManager
 import com.example.audio.AudioPlayerManager
 import com.example.audio.LiveVoiceProcessor
 import com.example.data.AppDatabase
@@ -16,6 +17,9 @@ class VoiceChangerApp : Application() {
         private set
 
     lateinit var preferences: VoicePreferences
+        private set
+
+    lateinit var audioDeviceManager: AudioDeviceManager
         private set
 
     lateinit var liveVoiceProcessor: LiveVoiceProcessor
@@ -30,7 +34,8 @@ class VoiceChangerApp : Application() {
 
         database = AppDatabase.getDatabase(this)
         preferences = VoicePreferences(this)
-        liveVoiceProcessor = LiveVoiceProcessor(this)
+        audioDeviceManager = AudioDeviceManager(this)
+        liveVoiceProcessor = LiveVoiceProcessor(this, audioDeviceManager)
         audioPlayerManager = AudioPlayerManager(this)
 
         createNotificationChannels()
@@ -40,10 +45,10 @@ class VoiceChangerApp : Application() {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             val channel = NotificationChannel(
                 CHANNEL_ID_OVERLAY,
-                "Voice Changer Floating Service",
+                "Voice Changer Foreground Service",
                 NotificationManager.IMPORTANCE_LOW
             ).apply {
-                description = "Shows status of floating voice changer overlay controls"
+                description = "Shows live voice effects, audio routing status and quick controls"
                 setShowBadge(false)
             }
 

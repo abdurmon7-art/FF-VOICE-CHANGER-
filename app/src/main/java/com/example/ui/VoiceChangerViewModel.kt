@@ -6,16 +6,18 @@ import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.provider.Settings
-import android.widget.Toast
 import androidx.core.content.FileProvider
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.example.VoiceChangerApp
-import com.example.apps.AppInfo
-import com.example.apps.InstalledAppsManager
+import com.example.apps.AppRoutingCompatibility
+import com.example.apps.AppCompatibilityManager
+import com.example.audio.AudioDeviceManager
+import com.example.audio.AudioDiagnosticsState
 import com.example.audio.AudioEffectParams
 import com.example.audio.AudioPlayerManager
 import com.example.audio.LiveVoiceProcessor
+import com.example.audio.OutputRouteMode
 import com.example.audio.VoiceEffectType
 import com.example.data.RecordingDao
 import com.example.data.RecordingItem
@@ -35,16 +37,19 @@ import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
 
-enum class AppTab {
-    STUDIO,
-    RECORDINGS,
-    APPS_OVERLAY
+enum class AppTab(val title: String) {
+    STUDIO("Studio"),
+    MIC_TEST("Mic Test"),
+    DIAGNOSTICS("Diagnostics"),
+    COMPATIBILITY("Compatibility"),
+    RECORDINGS("Recordings")
 }
 
 class VoiceChangerViewModel(application: Application) : AndroidViewModel(application) {
 
     private val app = application as VoiceChangerApp
-    private val liveProcessor: LiveVoiceProcessor = app.liveVoiceProcessor
+    val liveProcessor: LiveVoiceProcessor = app.liveVoiceProcessor
+    val audioDeviceManager: AudioDeviceManager = app.audioDeviceManager
     val playerManager: AudioPlayerManager = app.audioPlayerManager
     private val recordingDao: RecordingDao = app.database.recordingDao()
     val preferences: VoicePreferences = app.preferences
@@ -65,8 +70,21 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
     val isLiveListening = liveProcessor.isLiveListening
     val isRecording = liveProcessor.isRecording
     val recordingDurationSec = liveProcessor.recordingDurationSec
-    val liveAmplitude = liveProcessor.amplitude
+    val inputAmplitude = liveProcessor.inputAmplitude
+    val outputAmplitude = liveProcessor.outputAmplitude
     val liveVisualizerBars = liveProcessor.visualizerBars
+    val measuredLatencyMs = liveProcessor.measuredLatencyMs
+    val isMuted = liveProcessor.isMuted
+
+    // Diagnostics State from AudioDeviceManager
+    val diagnostics: StateFlow<AudioDiagnosticsState> = audioDeviceManager.diagnostics
+
+    // Mic Test state
+    private val _isMicTesting = MutableStateFlow(false)
+    val isMicTesting = _isMicTesting.asStateFlow()
+
+    private val _micTestLoopback = MutableStateFlow(true)
+    val micTestLoopback = _micTestLoopback.asStateFlow()
 
     // Player States from AudioPlayerManager
     val isPlaying = playerManager.isPlaying
@@ -86,12 +104,15 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
             else list.filter { it.title.contains(query, ignoreCase = true) || it.effectType.contains(query, ignoreCase = true) }
         }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
 
-    // Installed Apps
-    private val _installedApps = MutableStateFlow<List<AppInfo>>(emptyList())
+    // Installed Apps with Compatibility
+    private val _compatibleApps = MutableStateFlow<List<AppRoutingCompatibility>>(emptyList())
     private val _appsSearchQuery = MutableStateFlow("")
     val appsSearchQuery = _appsSearchQuery.asStateFlow()
 
-    val filteredApps: StateFlow<List<AppInfo>> = _installedApps
+    private val _selectedAppForDetail = MutableStateFlow<AppRoutingCompatibility?>(null)
+    val selectedAppForDetail = _selectedAppForDetail.asStateFlow()
+
+    val filteredApps: StateFlow<List<AppRoutingCompatibility>> = _compatibleApps
         .combine(_appsSearchQuery) { apps, query ->
             if (query.isBlank()) apps
             else apps.filter { it.appName.contains(query, ignoreCase = true) || it.packageName.contains(query, ignoreCase = true) }
@@ -114,6 +135,7 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
     init {
         loadInstalledApps()
         updateDspParameters()
+        refreshAudioDiagnostics()
     }
 
     fun setTab(tab: AppTab) {
@@ -150,9 +172,44 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
         } else {
             val ok = liveProcessor.startLiveProcessing(enableSpeakerPlayback = true)
             if (!ok) {
-                _userMessage.value = "Microphone initialization failed. Please check permissions."
+                _userMessage.value = "Microphone initialization failed. Please verify RECORD_AUDIO permission."
             }
         }
+    }
+
+    fun toggleMicTest() {
+        if (_isMicTesting.value) {
+            _isMicTesting.value = false
+            liveProcessor.stopLiveProcessing()
+        } else {
+            _isMicTesting.value = true
+            val ok = liveProcessor.startLiveProcessing(enableSpeakerPlayback = _micTestLoopback.value)
+            if (!ok) {
+                _userMessage.value = "Microphone test could not start. Please check microphone permission."
+                _isMicTesting.value = false
+            }
+        }
+    }
+
+    fun setMicTestLoopback(enable: Boolean) {
+        _micTestLoopback.value = enable
+        if (_isMicTesting.value) {
+            liveProcessor.stopLiveProcessing()
+            liveProcessor.startLiveProcessing(enableSpeakerPlayback = enable)
+        }
+    }
+
+    fun setAudioRouteMode(mode: OutputRouteMode) {
+        audioDeviceManager.setRouteMode(mode)
+        _userMessage.value = "Audio routed to ${mode.label}"
+    }
+
+    fun refreshAudioDiagnostics() {
+        audioDeviceManager.refreshDeviceRouting()
+    }
+
+    fun setSelectedAppDetail(app: AppRoutingCompatibility?) {
+        _selectedAppForDetail.value = app
     }
 
     fun toggleRecording() {
@@ -199,7 +256,6 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
             playerManager.pause()
         } else {
             _activePlayingRecording.value = recording
-            // Match effect of the recording or allow current active effect
             val loaded = playerManager.loadFile(file)
             if (loaded) {
                 playerManager.play()
@@ -270,6 +326,33 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
         } catch (e: Exception) {
             e.printStackTrace()
             _userMessage.value = "Error sharing audio file."
+        }
+    }
+
+    fun shareRecordingToPackage(context: Context, recording: RecordingItem, targetPackage: String) {
+        try {
+            val file = File(recording.filePath)
+            if (!file.exists()) {
+                _userMessage.value = "File does not exist."
+                return
+            }
+            val uri: Uri = FileProvider.getUriForFile(
+                context,
+                "${context.packageName}.fileprovider",
+                file
+            )
+
+            val shareIntent = Intent(Intent.ACTION_SEND).apply {
+                type = "audio/wav"
+                putExtra(Intent.EXTRA_STREAM, uri)
+                putExtra(Intent.EXTRA_SUBJECT, recording.title)
+                setPackage(targetPackage)
+                addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            }
+            context.startActivity(shareIntent)
+        } catch (e: Exception) {
+            // If direct package share fails, fallback to standard chooser
+            shareRecording(context, recording)
         }
     }
 
@@ -369,7 +452,7 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
-    fun launchAppWithOverlay(context: Context, appInfo: AppInfo) {
+    fun launchAppWithOverlay(context: Context, appInfo: AppRoutingCompatibility) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.M && !Settings.canDrawOverlays(context)) {
             val intent = Intent(
                 Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
@@ -382,7 +465,7 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
             return
         }
 
-        // Start overlay service
+        // Start overlay service & background audio
         preferences.setOverlayActive(true)
         VoiceOverlayService.start(context)
 
@@ -414,8 +497,8 @@ class VoiceChangerViewModel(application: Application) : AndroidViewModel(applica
 
     private fun loadInstalledApps() {
         viewModelScope.launch {
-            val list = InstalledAppsManager.getInstalledApps(getApplication())
-            _installedApps.value = list
+            val list = AppCompatibilityManager.getAppsWithCompatibility(getApplication())
+            _compatibleApps.value = list
         }
     }
 

@@ -6,20 +6,22 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
-import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.navigationBarsPadding
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.shape.CircleShape
-import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Assessment
 import androidx.compose.material.icons.filled.DarkMode
 import androidx.compose.material.icons.filled.GraphicEq
+import androidx.compose.material.icons.filled.Hearing
 import androidx.compose.material.icons.filled.Layers
 import androidx.compose.material.icons.filled.LibraryMusic
 import androidx.compose.material.icons.filled.LightMode
 import androidx.compose.material.icons.filled.Mic
+import androidx.compose.material.icons.filled.Router
+import androidx.compose.material.icons.filled.Speed
 import androidx.compose.material3.Badge
 import androidx.compose.material3.BadgedBox
 import androidx.compose.material3.CenterAlignedTopAppBar
@@ -43,18 +45,18 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.remember
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
-import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import com.example.ui.screens.AppsOverlayScreen
+import com.example.ui.screens.AudioDiagnosticScreen
+import com.example.ui.screens.MicTestScreen
 import com.example.ui.screens.RecordingsScreen
 import com.example.ui.screens.StudioScreen
 import com.example.ui.theme.VibrantCrimson
 import com.example.ui.theme.VibrantDeepPurple
 import com.example.ui.theme.VibrantLavender
-import com.example.ui.theme.VibrantRosePink
 import com.example.ui.theme.VibrantSuccessGreen
 import com.example.ui.theme.VibrantWarningAmber
 
@@ -69,9 +71,11 @@ fun MainScreen(
     val currentTab by viewModel.currentTab.collectAsState()
     val isLiveListening by viewModel.isLiveListening.collectAsState()
     val isRecording by viewModel.isRecording.collectAsState()
+    val isMicTesting by viewModel.isMicTesting.collectAsState()
     val isDarkMode by viewModel.isDarkMode.collectAsState()
     val userMessage by viewModel.userMessage.collectAsState()
     val isOverlayActive by viewModel.isOverlayActive.collectAsState()
+    val diagnostics by viewModel.diagnostics.collectAsState()
 
     val snackbarHostState = remember { SnackbarHostState() }
 
@@ -138,7 +142,7 @@ fun MainScreen(
                     .navigationBarsPadding()
                     .testTag("bottom_nav_bar")
             ) {
-                // Studio Tab
+                // 1. Studio Tab
                 NavigationBarItem(
                     selected = currentTab == AppTab.STUDIO,
                     onClick = { viewModel.setTab(AppTab.STUDIO) },
@@ -156,7 +160,7 @@ fun MainScreen(
                             )
                         }
                     },
-                    label = { Text("Studio", fontWeight = FontWeight.SemiBold) },
+                    label = { Text("Studio", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = VibrantDeepPurple,
                         selectedTextColor = VibrantLavender,
@@ -167,17 +171,25 @@ fun MainScreen(
                     modifier = Modifier.testTag("nav_tab_studio")
                 )
 
-                // Recordings Tab
+                // 2. Mic Test Tab
                 NavigationBarItem(
-                    selected = currentTab == AppTab.RECORDINGS,
-                    onClick = { viewModel.setTab(AppTab.RECORDINGS) },
+                    selected = currentTab == AppTab.MIC_TEST,
+                    onClick = { viewModel.setTab(AppTab.MIC_TEST) },
                     icon = {
-                        Icon(
-                            imageVector = Icons.Default.LibraryMusic,
-                            contentDescription = "Recordings"
-                        )
+                        BadgedBox(
+                            badge = {
+                                if (isMicTesting) {
+                                    Badge(containerColor = VibrantSuccessGreen)
+                                }
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Hearing,
+                                contentDescription = "Mic Test"
+                            )
+                        }
                     },
-                    label = { Text("Recordings", fontWeight = FontWeight.SemiBold) },
+                    label = { Text("Mic Test", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = VibrantDeepPurple,
                         selectedTextColor = VibrantLavender,
@@ -185,13 +197,42 @@ fun MainScreen(
                         unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
                         unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
                     ),
-                    modifier = Modifier.testTag("nav_tab_recordings")
+                    modifier = Modifier.testTag("nav_tab_mictest")
                 )
 
-                // Apps & Overlay Tab
+                // 3. Diagnostics Tab
                 NavigationBarItem(
-                    selected = currentTab == AppTab.APPS_OVERLAY,
-                    onClick = { viewModel.setTab(AppTab.APPS_OVERLAY) },
+                    selected = currentTab == AppTab.DIAGNOSTICS,
+                    onClick = { viewModel.setTab(AppTab.DIAGNOSTICS) },
+                    icon = {
+                        BadgedBox(
+                            badge = {
+                                if (diagnostics.isAnotherAppRecording) {
+                                    Badge(containerColor = VibrantWarningAmber)
+                                }
+                            }
+                        ) {
+                            Icon(
+                                imageVector = Icons.Default.Router,
+                                contentDescription = "Diagnostics"
+                            )
+                        }
+                    },
+                    label = { Text("Diagnostics", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = VibrantDeepPurple,
+                        selectedTextColor = VibrantLavender,
+                        indicatorColor = VibrantLavender,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    modifier = Modifier.testTag("nav_tab_diagnostics")
+                )
+
+                // 4. Compatibility Tab
+                NavigationBarItem(
+                    selected = currentTab == AppTab.COMPATIBILITY,
+                    onClick = { viewModel.setTab(AppTab.COMPATIBILITY) },
                     icon = {
                         BadgedBox(
                             badge = {
@@ -202,11 +243,11 @@ fun MainScreen(
                         ) {
                             Icon(
                                 imageVector = Icons.Default.Layers,
-                                contentDescription = "Apps & Overlay"
+                                contentDescription = "Apps & Routing"
                             )
                         }
                     },
-                    label = { Text("Companion", fontWeight = FontWeight.SemiBold) },
+                    label = { Text("Apps", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
                     colors = NavigationBarItemDefaults.colors(
                         selectedIconColor = VibrantDeepPurple,
                         selectedTextColor = VibrantLavender,
@@ -214,7 +255,28 @@ fun MainScreen(
                         unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
                         unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
                     ),
-                    modifier = Modifier.testTag("nav_tab_companion")
+                    modifier = Modifier.testTag("nav_tab_apps")
+                )
+
+                // 5. Recordings Tab
+                NavigationBarItem(
+                    selected = currentTab == AppTab.RECORDINGS,
+                    onClick = { viewModel.setTab(AppTab.RECORDINGS) },
+                    icon = {
+                        Icon(
+                            imageVector = Icons.Default.LibraryMusic,
+                            contentDescription = "Recordings"
+                        )
+                    },
+                    label = { Text("Saved", fontSize = 11.sp, fontWeight = FontWeight.SemiBold) },
+                    colors = NavigationBarItemDefaults.colors(
+                        selectedIconColor = VibrantDeepPurple,
+                        selectedTextColor = VibrantLavender,
+                        indicatorColor = VibrantLavender,
+                        unselectedIconColor = MaterialTheme.colorScheme.onSurfaceVariant,
+                        unselectedTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+                    ),
+                    modifier = Modifier.testTag("nav_tab_recordings")
                 )
             }
         }
@@ -232,8 +294,18 @@ fun MainScreen(
                         onRequestMicPermission = onRequestMicPermission,
                         hasMicPermission = hasMicPermission
                     )
+                    AppTab.MIC_TEST -> MicTestScreen(
+                        viewModel = viewModel,
+                        onRequestMicPermission = onRequestMicPermission,
+                        hasMicPermission = hasMicPermission
+                    )
+                    AppTab.DIAGNOSTICS -> AudioDiagnosticScreen(
+                        viewModel = viewModel,
+                        onRequestMicPermission = onRequestMicPermission,
+                        hasMicPermission = hasMicPermission
+                    )
+                    AppTab.COMPATIBILITY -> AppsOverlayScreen(viewModel = viewModel)
                     AppTab.RECORDINGS -> RecordingsScreen(viewModel = viewModel)
-                    AppTab.APPS_OVERLAY -> AppsOverlayScreen(viewModel = viewModel)
                 }
             }
         }

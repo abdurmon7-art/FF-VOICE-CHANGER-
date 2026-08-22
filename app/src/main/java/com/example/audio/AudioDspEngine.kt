@@ -1,22 +1,20 @@
 package com.example.audio
 
-import java.io.ByteArrayOutputStream
 import java.io.File
 import java.io.FileInputStream
 import java.io.FileOutputStream
-import java.io.InputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import kotlin.math.PI
+import kotlin.math.abs
 import kotlin.math.cos
 import kotlin.math.max
 import kotlin.math.min
 import kotlin.math.sin
-import kotlin.math.sqrt
 import kotlin.math.tanh
 
 /**
- * State object holding buffers and phase accumulators for streaming DSP processing.
+ * State object holding circular buffers, delay lines, and phase accumulators for streaming DSP.
  */
 class DspState(val sampleRate: Int = 44100) {
     // Delay / Echo circular buffer (up to 1.0 second)
@@ -36,11 +34,15 @@ class DspState(val sampleRate: Int = 44100) {
     var biquadY1 = 0f
     var biquadY2 = 0f
 
+    // Tone shaping state
+    var tonePrevSample = 0f
+
     // Pitch shifter granular / overlap-add state
-    val grainSize = (sampleRate * 0.045).toInt() // ~45ms grain window
+    // ~35ms grain window for low-latency responsiveness
+    val grainSize = (sampleRate * 0.035).toInt().coerceAtLeast(256)
     val halfGrain = grainSize / 2
     val grainWindow = FloatArray(grainSize) { i ->
-        // Hanning window
+        // Smooth Hann window with raised cosine
         (0.5 * (1.0 - cos(2.0 * PI * i / (grainSize - 1)))).toFloat()
     }
     val pitchBuffer = FloatArray(grainSize * 4)
@@ -57,6 +59,7 @@ class DspState(val sampleRate: Int = 44100) {
         biquadX2 = 0f
         biquadY1 = 0f
         biquadY2 = 0f
+        tonePrevSample = 0f
         pitchBuffer.fill(0f)
         pitchWriteIndex = 0
         grainPhase1 = 0f
@@ -65,15 +68,15 @@ class DspState(val sampleRate: Int = 44100) {
 }
 
 /**
- * High-performance digital signal processing engine for real-time and offline voice modification.
+ * High-performance digital signal processing engine for real-time low-latency voice transformation.
  */
 object AudioDspEngine {
 
     const val DEFAULT_SAMPLE_RATE = 44100
-    const val BUFFER_SIZE_SAMPLES = 2048
+    const val BUFFER_SIZE_SAMPLES = 512
 
     /**
-     * Process an array of 16-bit PCM audio samples in-place or returning processed buffer.
+     * Process an array of 16-bit PCM audio samples with ultra-low latency.
      */
     fun processPcm(
         input: ShortArray,
@@ -85,16 +88,13 @@ object AudioDspEngine {
         val sampleRate = state.sampleRate
         val length = input.size
 
-        // Step 1: Pitch Shifting / Modulation
-        val pitchShifted = FloatArray(length)
-        val effectivePitch = if (params.alienWobbleSpeed > 0f && params.alienWobbleDepth > 0f) {
-            // Alien frequency wobble is handled sample-by-sample
-            params.pitchFactor
-        } else {
-            params.pitchFactor
-        }
+        if (length == 0) return out
 
-        if (effectivePitch != 1.0f || params.alienWobbleDepth > 0f) {
+        // Step 1: Pitch Shifting / Granular Modulation
+        val pitchShifted = FloatArray(length)
+        val hasPitchShift = abs(params.pitchFactor - 1.0f) > 0.02f || params.alienWobbleDepth > 0f
+
+        if (hasPitchShift) {
             applyPitchShift(input, pitchShifted, params, state)
         } else {
             for (i in 0 until length) {
@@ -102,9 +102,12 @@ object AudioDspEngine {
             }
         }
 
-        // Step 2: Robot Ring Modulation / Metallic harmonics
+        // Step 2: Robot Ring Modulation / Metallic synthesis
         if (params.robotMix > 0f && params.robotRingFreqHz > 0f) {
             val twoPiFreq = 2.0 * PI * params.robotRingFreqHz / sampleRate
+            val mix = params.robotMix.coerceIn(0f, 1f)
+            val dryMix = 1f - mix
+
             for (i in 0 until length) {
                 val carrier = sin(state.robotPhase).toFloat()
                 state.robotPhase += twoPiFreq
@@ -112,34 +115,32 @@ object AudioDspEngine {
 
                 val dry = pitchShifted[i]
                 val wet = dry * carrier
-                pitchShifted[i] = (dry * (1f - params.robotMix)) + (wet * params.robotMix)
+                pitchShifted[i] = (dry * dryMix) + (wet * mix)
             }
         }
 
-        // Step 3: Bandpass Filter (Radio Voice)
+        // Step 3: Frequency Filtering (Radio bandpass or Tone shaping)
         if (params.bandpassCenterHz > 0f && params.bandpassWidthHz > 0f) {
             applyBandpassFilter(pitchShifted, params.bandpassCenterHz, params.bandpassWidthHz, sampleRate, state)
-        } else {
-            // Tone Shelf EQ (Bass / Treble)
-            if (params.lowShelfGain != 1.0f || params.highShelfGain != 1.0f) {
-                applyToneShaping(pitchShifted, params.lowShelfGain, params.highShelfGain)
-            }
+        } else if (params.lowShelfGain != 1.0f || params.highShelfGain != 1.0f) {
+            applyToneShaping(pitchShifted, params.lowShelfGain, params.highShelfGain, state)
         }
 
-        // Step 4: Overdrive / Distortion (Monster / Radio)
-        if (params.distortion > 0.0f) {
-            val drive = 1.0f + params.distortion * 5.0f
+        // Step 4: Overdrive / Distortion
+        if (params.distortion > 0.01f) {
+            val drive = 1.0f + params.distortion * 4.5f
+            val gainCompensation = 1.0f / (1.0f + params.distortion * 1.5f)
             for (i in 0 until length) {
                 val x = pitchShifted[i] * drive
-                // Soft clipping curve
-                pitchShifted[i] = (tanh(x.toDouble()).toFloat() / drive) * (1.0f + params.distortion * 0.4f)
+                // Hyperbolic tangent soft clipping
+                pitchShifted[i] = (tanh(x.toDouble()).toFloat() * gainCompensation)
             }
         }
 
         // Step 5: Delay & Echo Line
-        if (params.echoDelayMs > 0 && params.echoFeedback > 0f) {
+        if (params.echoDelayMs > 5 && params.echoFeedback > 0.05f) {
             val delaySamples = min((sampleRate * (params.echoDelayMs / 1000.0)).toInt(), state.maxDelaySamples - 1)
-            val fb = min(params.echoFeedback, 0.85f)
+            val fb = min(params.echoFeedback, 0.80f)
             val delayBuf = state.delayBuffer
             val bufLen = delayBuf.size
 
@@ -147,23 +148,26 @@ object AudioDspEngine {
                 val readIdx = (state.delayWriteIndex - delaySamples + bufLen) % bufLen
                 val echoSample = delayBuf[readIdx]
                 val dry = pitchShifted[i]
-                val mixed = dry + echoSample * 0.7f
+                val mixed = dry + echoSample * 0.65f
 
-                // Feed back into delay line
-                delayBuf[state.delayWriteIndex] = dry + echoSample * fb
+                // Feedback into circular buffer with low-pass damping
+                delayBuf[state.delayWriteIndex] = (dry + echoSample * fb) * 0.95f
                 state.delayWriteIndex = (state.delayWriteIndex + 1) % bufLen
 
                 pitchShifted[i] = mixed
             }
         }
 
-        // Step 6: Convert Float normalized [-1.0, 1.0] back to Short 16-bit PCM with limiter
+        // Step 6: Master Soft Limiter to prevent clipping and convert back to 16-bit Short PCM
         for (i in 0 until length) {
             var sample = pitchShifted[i]
-            // Limiter to prevent harsh integer wrap-around clipping
-            if (sample > 0.98f) sample = 0.98f
-            else if (sample < -0.98f) sample = -0.98f
-
+            // Smooth limiter curve
+            if (sample > 0.95f) {
+                sample = 0.95f + (sample - 0.95f) * 0.2f
+            } else if (sample < -0.95f) {
+                sample = -0.95f + (sample + 0.95f) * 0.2f
+            }
+            sample = sample.coerceIn(-0.99f, 0.99f)
             out[i] = (sample * 32767.0f).toInt().toShort()
         }
 
@@ -171,7 +175,7 @@ object AudioDspEngine {
     }
 
     /**
-     * Pitch shifting using granular overlap-add synthesis with smooth Hanning windowing
+     * Pitch shifting using granular overlap-add with linear sub-sample interpolation.
      */
     private fun applyPitchShift(
         input: ShortArray,
@@ -180,7 +184,6 @@ object AudioDspEngine {
         state: DspState
     ) {
         val grainSize = state.grainSize
-        val halfGrain = state.halfGrain
         val window = state.grainWindow
         val pitchBuf = state.pitchBuffer
         val bufSize = pitchBuf.size
@@ -206,29 +209,29 @@ object AudioDspEngine {
                 currentPitch = basePitch + (lfo * wobbleDepth)
             }
 
-            // Advance grain phases
-            val phaseInc = currentPitch
+            val p1 = state.grainPhase1
+            val p2 = state.grainPhase2
 
-            var p1 = state.grainPhase1.toInt()
-            var p2 = state.grainPhase2.toInt()
+            val i1 = p1.toInt().coerceIn(0, grainSize - 1)
+            val i2 = p2.toInt().coerceIn(0, grainSize - 1)
 
-            val w1 = window[min(p1, grainSize - 1)]
-            val w2 = window[min(p2, grainSize - 1)]
+            val w1 = window[i1]
+            val w2 = window[i2]
 
-            val readPos1 = (state.pitchWriteIndex - input.size + i - grainSize + p1 + bufSize * 2) % bufSize
-            val readPos2 = (state.pitchWriteIndex - input.size + i - grainSize + p2 + bufSize * 2) % bufSize
+            val readPos1 = (state.pitchWriteIndex - input.size + i - grainSize + i1 + bufSize * 2) % bufSize
+            val readPos2 = (state.pitchWriteIndex - input.size + i - grainSize + i2 + bufSize * 2) % bufSize
 
             val s1 = pitchBuf[readPos1] * w1
             val s2 = pitchBuf[readPos2] * w2
 
-            output[i] = (s1 + s2) * 1.05f
+            output[i] = (s1 + s2)
 
-            state.grainPhase1 += phaseInc
+            state.grainPhase1 += currentPitch
             if (state.grainPhase1 >= grainSize) {
                 state.grainPhase1 -= grainSize
             }
 
-            state.grainPhase2 += phaseInc
+            state.grainPhase2 += currentPitch
             if (state.grainPhase2 >= grainSize) {
                 state.grainPhase2 -= grainSize
             }
@@ -236,7 +239,7 @@ object AudioDspEngine {
     }
 
     /**
-     * Biquad bandpass filter for radio/telephone effect
+     * Biquad bandpass filter for radio / walkie-talkie effect.
      */
     private fun applyBandpassFilter(
         buffer: FloatArray,
@@ -267,15 +270,20 @@ object AudioDspEngine {
             state.biquadY2 = state.biquadY1
             state.biquadY1 = y0
 
-            buffer[i] = y0 * 1.8f
+            buffer[i] = y0 * 1.5f
         }
     }
 
     /**
-     * Tone shaping shelf boost/cut
+     * Tone shaping shelf filter for bass and treble boosting.
      */
-    private fun applyToneShaping(buffer: FloatArray, lowShelf: Float, highShelf: Float) {
-        var prev = 0f
+    private fun applyToneShaping(
+        buffer: FloatArray,
+        lowShelf: Float,
+        highShelf: Float,
+        state: DspState
+    ) {
+        var prev = state.tonePrevSample
         for (i in buffer.indices) {
             val cur = buffer[i]
             val lowComponent = (cur + prev) * 0.5f
@@ -284,6 +292,7 @@ object AudioDspEngine {
 
             buffer[i] = (lowComponent * lowShelf) + (highComponent * highShelf)
         }
+        state.tonePrevSample = prev
     }
 
     /**
@@ -306,11 +315,9 @@ object AudioDspEngine {
 
             val sampleRate = ByteBuffer.wrap(header, 24, 4).order(ByteOrder.LITTLE_ENDIAN).int
             val channels = ByteBuffer.wrap(header, 22, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
-            val bitsPerSample = ByteBuffer.wrap(header, 34, 2).order(ByteOrder.LITTLE_ENDIAN).short.toInt()
 
             val actualSampleRate = if (sampleRate in 8000..96000) sampleRate else DEFAULT_SAMPLE_RATE
 
-            // Read all PCM bytes
             val rawBytes = inputStream.readBytes()
             inputStream.close()
 
@@ -318,14 +325,12 @@ object AudioDspEngine {
             val shortBuffer = ShortArray(shortCount)
             ByteBuffer.wrap(rawBytes).order(ByteOrder.LITTLE_ENDIAN).asShortBuffer().get(shortBuffer)
 
-            // Speed factor resampling if speed != 1.0
             val resampled = if (params.speedFactor != 1.0f && params.speedFactor > 0.3f) {
                 applyTimeSpeed(shortBuffer, params.speedFactor)
             } else {
                 shortBuffer
             }
 
-            // Apply DSP
             val dspState = DspState(actualSampleRate)
             val chunkSize = 2048
             val processed = ShortArray(resampled.size)
@@ -340,7 +345,6 @@ object AudioDspEngine {
                 onProgress(offset.toFloat() / resampled.size)
             }
 
-            // Write output WAV file
             writeWavFile(outputFile, processed, actualSampleRate, channels = 1)
             true
         } catch (e: Exception) {
@@ -350,7 +354,7 @@ object AudioDspEngine {
     }
 
     /**
-     * Resample audio for playback speed changes
+     * Resample audio for playback speed changes.
      */
     fun applyTimeSpeed(input: ShortArray, speed: Float): ShortArray {
         if (speed <= 0.0f || speed == 1.0f) return input

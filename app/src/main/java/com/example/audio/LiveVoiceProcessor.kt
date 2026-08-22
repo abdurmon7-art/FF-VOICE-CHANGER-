@@ -8,6 +8,11 @@ import android.media.AudioManager
 import android.media.AudioRecord
 import android.media.AudioTrack
 import android.media.MediaRecorder
+import android.media.audiofx.AcousticEchoCanceler
+import android.media.audiofx.AutomaticGainControl
+import android.media.audiofx.NoiseSuppressor
+import android.os.Build
+import android.os.SystemClock
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -25,10 +30,13 @@ import kotlin.math.min
 import kotlin.math.sqrt
 
 /**
- * Controller for real-time microphone voice transformation, live playback monitoring,
- * and concurrent high-quality audio recording.
+ * Controller for real-time low-latency microphone voice transformation, live playback monitoring,
+ * hardware acoustic echo cancellation, and concurrent high-quality audio recording.
  */
-class LiveVoiceProcessor(private val context: Context) {
+class LiveVoiceProcessor(
+    private val context: Context,
+    val audioDeviceManager: AudioDeviceManager
+) {
 
     private val sampleRate = AudioDspEngine.DEFAULT_SAMPLE_RATE
     private val channelConfigIn = AudioFormat.CHANNEL_IN_MONO
@@ -38,6 +46,11 @@ class LiveVoiceProcessor(private val context: Context) {
     private var audioRecord: AudioRecord? = null
     private var audioTrack: AudioTrack? = null
 
+    // Hardware acoustic enhancement effects
+    private var echoCanceler: AcousticEchoCanceler? = null
+    private var noiseSuppressor: NoiseSuppressor? = null
+    private var gainControl: AutomaticGainControl? = null
+
     private var processingJob: Job? = null
     private val scope = CoroutineScope(Dispatchers.Default)
 
@@ -45,7 +58,7 @@ class LiveVoiceProcessor(private val context: Context) {
     var currentParams: AudioEffectParams = AudioEffectParams()
         @Synchronized set
 
-    // State flows for UI
+    // State flows for UI & Diagnostics
     private val _isLiveListening = MutableStateFlow(false)
     val isLiveListening = _isLiveListening.asStateFlow()
 
@@ -55,11 +68,20 @@ class LiveVoiceProcessor(private val context: Context) {
     private val _recordingDurationSec = MutableStateFlow(0)
     val recordingDurationSec = _recordingDurationSec.asStateFlow()
 
-    private val _amplitude = MutableStateFlow(0f)
-    val amplitude = _amplitude.asStateFlow()
+    private val _inputAmplitude = MutableStateFlow(0f)
+    val inputAmplitude = _inputAmplitude.asStateFlow()
 
-    private val _visualizerBars = MutableStateFlow(List(16) { 0.1f })
+    private val _outputAmplitude = MutableStateFlow(0f)
+    val outputAmplitude = _outputAmplitude.asStateFlow()
+
+    private val _visualizerBars = MutableStateFlow(List(16) { 0.08f })
     val visualizerBars = _visualizerBars.asStateFlow()
+
+    private val _measuredLatencyMs = MutableStateFlow(16)
+    val measuredLatencyMs = _measuredLatencyMs.asStateFlow()
+
+    private val _isMuted = MutableStateFlow(false)
+    val isMuted = _isMuted.asStateFlow()
 
     // Recording storage
     private var activeRecordingFile: File? = null
@@ -67,9 +89,13 @@ class LiveVoiceProcessor(private val context: Context) {
     private var recordedSamplesCount = 0L
     private var recordingStartTime = 0L
 
+    fun setMuted(muted: Boolean) {
+        _isMuted.value = muted
+    }
+
     /**
-     * Start live microphone processing.
-     * @param enableSpeakerPlayback if true, outputs transformed mic audio to speaker/headphones
+     * Start live low-latency microphone processing.
+     * @param enableSpeakerPlayback if true, outputs transformed mic audio to selected audio route
      */
     @SuppressLint("MissingPermission")
     @Synchronized
@@ -79,23 +105,30 @@ class LiveVoiceProcessor(private val context: Context) {
         }
 
         try {
+            audioDeviceManager.requestAudioFocus()
+
             val minBufSizeIn = AudioRecord.getMinBufferSize(sampleRate, channelConfigIn, audioFormat)
             val minBufSizeOut = AudioTrack.getMinBufferSize(sampleRate, channelConfigOut, audioFormat)
 
             if (minBufSizeIn <= 0 || minBufSizeOut <= 0) return false
 
-            val inBufferSize = max(minBufSizeIn * 2, 4096)
-            val outBufferSize = max(minBufSizeOut * 2, 4096)
+            val inBufferSize = max(minBufSizeIn * 2, 2048)
+            val outBufferSize = max(minBufSizeOut * 2, 2048)
 
-            audioRecord = AudioRecord(
-                MediaRecorder.AudioSource.VOICE_COMMUNICATION,
-                sampleRate,
-                channelConfigIn,
-                audioFormat,
-                inBufferSize
-            )
+            // Prefer VOICE_COMMUNICATION for automatic hardware echo cancellation and low latency
+            audioRecord = try {
+                AudioRecord(
+                    MediaRecorder.AudioSource.VOICE_COMMUNICATION,
+                    sampleRate,
+                    channelConfigIn,
+                    audioFormat,
+                    inBufferSize
+                )
+            } catch (e: Exception) {
+                null
+            }
 
-            // Fallback to MIC if VOICE_COMMUNICATION fails
+            // Fallback to MIC if VOICE_COMMUNICATION fails or is uninitialized
             if (audioRecord?.state != AudioRecord.STATE_INITIALIZED) {
                 audioRecord?.release()
                 audioRecord = AudioRecord(
@@ -111,9 +144,19 @@ class LiveVoiceProcessor(private val context: Context) {
                 return false
             }
 
+            val sessionId = audioRecord?.audioSessionId ?: 0
+            if (sessionId != 0) {
+                attachHardwareAudioFx(sessionId)
+            }
+
             val audioAttributes = AudioAttributes.Builder()
                 .setUsage(AudioAttributes.USAGE_MEDIA)
                 .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+                .apply {
+                    if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                        setFlags(AudioAttributes.FLAG_LOW_LATENCY)
+                    }
+                }
                 .build()
 
             val audioFormatSpec = AudioFormat.Builder()
@@ -134,6 +177,7 @@ class LiveVoiceProcessor(private val context: Context) {
             audioTrack?.play()
 
             _isLiveListening.value = true
+            audioDeviceManager.setVoiceServiceRunning(true)
 
             startProcessingLoop(enableSpeakerPlayback)
             return true
@@ -144,19 +188,68 @@ class LiveVoiceProcessor(private val context: Context) {
         }
     }
 
+    private fun attachHardwareAudioFx(sessionId: Int) {
+        try {
+            if (AcousticEchoCanceler.isAvailable()) {
+                echoCanceler = AcousticEchoCanceler.create(sessionId)?.apply {
+                    enabled = true
+                }
+            }
+            if (NoiseSuppressor.isAvailable()) {
+                noiseSuppressor = NoiseSuppressor.create(sessionId)?.apply {
+                    enabled = true
+                }
+            }
+            if (AutomaticGainControl.isAvailable()) {
+                gainControl = AutomaticGainControl.create(sessionId)?.apply {
+                    enabled = true
+                }
+            }
+        } catch (e: Exception) {
+            // Hardware effects not available on some emulators/devices
+        }
+    }
+
+    private fun releaseHardwareAudioFx() {
+        try {
+            echoCanceler?.release()
+            noiseSuppressor?.release()
+            gainControl?.release()
+        } catch (e: Exception) {
+            // ignore
+        }
+        echoCanceler = null
+        noiseSuppressor = null
+        gainControl = null
+    }
+
     private fun startProcessingLoop(enableSpeakerPlayback: Boolean) {
         processingJob?.cancel()
         processingJob = scope.launch {
-            val chunkSize = 1024
+            // Use optimal low-latency buffer chunk (512 samples ~= 11.6ms at 44.1kHz)
+            val chunkSize = 512
             val inBuffer = ShortArray(chunkSize)
             val outBuffer = ShortArray(chunkSize)
             val dspState = DspState(sampleRate)
-            val byteBuffer = ByteArray(chunkSize * 2)
+
+            var cycleCount = 0
+            var accumulatedLatencyUs = 0L
 
             while (isActive && _isLiveListening.value) {
                 val record = audioRecord ?: break
+                val startCycleTime = SystemClock.elapsedRealtimeNanos()
+
                 val read = record.read(inBuffer, 0, chunkSize)
                 if (read > 0) {
+                    // Check if muted
+                    if (_isMuted.value) {
+                        inBuffer.fill(0, 0, read)
+                    }
+
+                    // Compute input amplitude
+                    val inAmp = computeRms(inBuffer, read)
+                    _inputAmplitude.value = inAmp
+
                     val params = currentParams
                     val processedChunk = AudioDspEngine.processPcm(
                         input = if (read == chunkSize) inBuffer else inBuffer.copyOf(read),
@@ -165,37 +258,49 @@ class LiveVoiceProcessor(private val context: Context) {
                         output = outBuffer
                     )
 
-                    // Stream to speaker if enabled
+                    // Write to AudioTrack if playback is enabled
                     if (enableSpeakerPlayback) {
                         audioTrack?.write(processedChunk, 0, read)
                     }
 
-                    // Save to active recording if recording is on
+                    // Save to active recording if recording is enabled
                     if (_isRecording.value) {
                         saveChunkToRecording(processedChunk, read)
                     }
 
-                    // Compute amplitude and visualizer bars
+                    // Compute output amplitude and visualizer
+                    val outAmp = computeRms(processedChunk, read)
+                    _outputAmplitude.value = outAmp
                     computeVisualizer(processedChunk, read)
+
+                    val endCycleTime = SystemClock.elapsedRealtimeNanos()
+                    val cycleDurationMs = ((endCycleTime - startCycleTime) / 1_000_000L).toInt() + 10 // hardware roundtrip estimate
+                    accumulatedLatencyUs += cycleDurationMs
+                    cycleCount++
+
+                    if (cycleCount >= 20) {
+                        val avgLatency = (accumulatedLatencyUs / cycleCount).toInt().coerceIn(8, 90)
+                        _measuredLatencyMs.value = avgLatency
+                        audioDeviceManager.setLatencyMeasurement(avgLatency)
+                        cycleCount = 0
+                        accumulatedLatencyUs = 0
+                    }
                 }
             }
         }
     }
 
-    private fun computeVisualizer(samples: ShortArray, length: Int) {
+    private fun computeRms(samples: ShortArray, length: Int): Float {
         var sumSquares = 0.0
-        var peak = 0
         for (i in 0 until length) {
-            val sample = abs(samples[i].toInt())
-            if (sample > peak) peak = sample
+            val sample = samples[i].toInt()
             sumSquares += (sample * sample)
         }
-
         val rms = sqrt(sumSquares / length)
-        val normalizedAmp = (rms / 12000.0).toFloat().coerceIn(0.02f, 1.0f)
-        _amplitude.value = normalizedAmp
+        return (rms / 14000.0).toFloat().coerceIn(0.0f, 1.0f)
+    }
 
-        // Pseudo spectrum bars using sub-slices
+    private fun computeVisualizer(samples: ShortArray, length: Int) {
         val barCount = 16
         val sliceSize = length / barCount
         if (sliceSize > 0) {
@@ -205,7 +310,7 @@ class LiveVoiceProcessor(private val context: Context) {
                 for (s in start until min(start + sliceSize, length)) {
                     sliceSum += abs(samples[s].toDouble())
                 }
-                val avg = (sliceSum / sliceSize) / 10000.0
+                val avg = (sliceSum / sliceSize) / 9000.0
                 avg.toFloat().coerceIn(0.08f, 1.0f)
             }
             _visualizerBars.value = bars
@@ -237,7 +342,6 @@ class LiveVoiceProcessor(private val context: Context) {
     fun startRecording(targetDir: File): File? {
         if (_isRecording.value) return activeRecordingFile
 
-        // Auto start mic if not listening
         if (!_isLiveListening.value) {
             startLiveProcessing(enableSpeakerPlayback = false)
         }
@@ -295,8 +399,11 @@ class LiveVoiceProcessor(private val context: Context) {
     @Synchronized
     fun stopLiveProcessing() {
         _isLiveListening.value = false
+        audioDeviceManager.setVoiceServiceRunning(false)
         processingJob?.cancel()
         processingJob = null
+
+        releaseHardwareAudioFx()
 
         try {
             audioRecord?.stop()
@@ -314,7 +421,10 @@ class LiveVoiceProcessor(private val context: Context) {
         }
         audioTrack = null
 
-        _amplitude.value = 0f
+        audioDeviceManager.abandonAudioFocus()
+
+        _inputAmplitude.value = 0f
+        _outputAmplitude.value = 0f
         _visualizerBars.value = List(16) { 0.08f }
     }
 
