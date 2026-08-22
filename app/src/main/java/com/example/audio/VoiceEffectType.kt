@@ -59,6 +59,18 @@ enum class VoiceEffectType(
             highShelfGain = 1.35f
         )
     ),
+    HIGH(
+        title = "High Voice",
+        description = "Crisp, bright high-pitched vocal boost",
+        icon = Icons.Default.MusicNote,
+        themeColor = Color(0xFF06B6D4),
+        defaultParams = AudioEffectParams(
+            pitchFactor = 1.40f,
+            speedFactor = 1.0f,
+            lowShelfGain = 0.70f,
+            highShelfGain = 1.50f
+        )
+    ),
     CHILD(
         title = "Child Voice",
         description = "Light high-pitched youthful voice",
