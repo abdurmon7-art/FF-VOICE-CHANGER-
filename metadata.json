@@ -1,0 +1,6 @@
+{
+  "name": "Voice Changer",
+  "description": "Modern Voice Changer with real-time mic FX, audio recording, sound effects (Robot, Monster, Alien, Deep, Chipmunk, Echo, Radio, etc.), file import/export, and quick floating overlay.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
